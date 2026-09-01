@@ -24,7 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"                                 //nolint:staticcheck // suppress complaining on Deprecated package
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions"         //nolint:staticcheck // suppress complaining on Deprecated package
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions/v1beta2" //nolint:staticcheck // suppress complaining on Deprecated package
@@ -55,11 +55,11 @@ func credentialFingerprintForCluster(ctx context.Context, cluster *infrav1.Nutan
 	return nutanixclient.CredentialFingerprint(endpoint)
 }
 
-func emitWarningEvent(recorder record.EventRecorder, obj client.Object, reason, message string) {
+func emitWarningEvent(recorder events.EventRecorder, obj client.Object, reason, message string) {
 	if recorder == nil || obj == nil {
 		return
 	}
-	recorder.Event(obj, corev1.EventTypeWarning, reason, message)
+	recorder.Eventf(obj, nil, corev1.EventTypeWarning, reason, "Pause", message)
 }
 
 func markPrismAuthFailed(cluster *infrav1.NutanixCluster, message string) {
@@ -77,7 +77,7 @@ func markPrismAuthFailed(cluster *infrav1.NutanixCluster, message string) {
 
 // skipPrismCallsDueToAuthBackoff returns a requeue result when the cluster is deleting
 // and the shared auth circuit is open. Callers must not contact Prism Central when paused is true.
-func skipPrismCallsDueToAuthBackoff(ctx context.Context, recorder record.EventRecorder, eventObj client.Object, cluster *infrav1.NutanixCluster, deleting bool, secretInformer v1.SecretInformer, mapInformer v1.ConfigMapInformer) (ctrl.Result, bool) {
+func skipPrismCallsDueToAuthBackoff(ctx context.Context, recorder events.EventRecorder, eventObj client.Object, cluster *infrav1.NutanixCluster, deleting bool, secretInformer v1.SecretInformer, mapInformer v1.ConfigMapInformer) (ctrl.Result, bool) {
 	if !deleting || cluster == nil {
 		return ctrl.Result{}, false
 	}
@@ -99,7 +99,7 @@ func skipPrismCallsDueToAuthBackoff(ctx context.Context, recorder record.EventRe
 
 // requeueUnauthorizedPrismError records a 401 during deletion, drops cached clients, and
 // requeues with exponential backoff instead of immediately retrying Prism Central.
-func requeueUnauthorizedPrismError(ctx context.Context, recorder record.EventRecorder, eventObj client.Object, cluster *infrav1.NutanixCluster, deleting bool, err error, secretInformer v1.SecretInformer, mapInformer v1.ConfigMapInformer) (ctrl.Result, bool) {
+func requeueUnauthorizedPrismError(ctx context.Context, recorder events.EventRecorder, eventObj client.Object, cluster *infrav1.NutanixCluster, deleting bool, err error, secretInformer v1.SecretInformer, mapInformer v1.ConfigMapInformer) (ctrl.Result, bool) {
 	if !deleting || cluster == nil || !nutanixclient.IsUnauthorizedError(err) {
 		return ctrl.Result{}, false
 	}

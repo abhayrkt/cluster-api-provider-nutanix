@@ -27,7 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions" //nolint:staticcheck // suppress complaining on Deprecated package
 
 	infrav1 "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/api/v1beta1"
@@ -55,7 +55,7 @@ func TestSkipPrismCallsDueToAuthBackoff(t *testing.T) {
 
 	ctx := context.Background()
 	cluster := &infrav1.NutanixCluster{ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "ns"}}
-	recorder := record.NewFakeRecorder(8)
+	recorder := events.NewFakeRecorder(8)
 
 	result, paused := skipPrismCallsDueToAuthBackoff(ctx, recorder, cluster, cluster, true, nil, nil)
 	assert.False(t, paused)
@@ -80,7 +80,7 @@ func TestRequeueUnauthorizedPrismError(t *testing.T) {
 
 	ctx := context.Background()
 	cluster := &infrav1.NutanixCluster{ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "ns"}}
-	recorder := record.NewFakeRecorder(8)
+	recorder := events.NewFakeRecorder(8)
 	authErr := errors.New("invalid Nutanix credentials")
 
 	result, handled := requeueUnauthorizedPrismError(ctx, recorder, cluster, cluster, false, authErr, nil, nil)
@@ -109,7 +109,7 @@ func TestRequeueUnauthorizedPrismErrorWarnsAfterThreshold(t *testing.T) {
 
 	ctx := context.Background()
 	cluster := &infrav1.NutanixCluster{ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "ns"}}
-	recorder := record.NewFakeRecorder(8)
+	recorder := events.NewFakeRecorder(8)
 	authErr := errors.New("401 Unauthorized")
 
 	for i := 0; i < nutanixclient.DefaultAuthFailureThreshold; i++ {

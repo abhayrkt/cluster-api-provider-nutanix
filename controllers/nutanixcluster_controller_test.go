@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
@@ -1224,8 +1225,9 @@ func TestNutanixClusterReconciler_SetupWithManager(t *testing.T) {
 	mgr.EXPECT().GetClient().Return(mockClient).AnyTimes()
 
 	reconciler := &NutanixClusterReconciler{
-		Client: mockClient,
-		Scheme: scheme,
+		Client:   mockClient,
+		Scheme:   scheme,
+		Recorder: events.NewFakeRecorder(1),
 		controllerConfig: &ControllerConfig{
 			MaxConcurrentReconciles: 1,
 			SkipNameValidation:      true, // Enable for tests

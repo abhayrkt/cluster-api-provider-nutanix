@@ -37,7 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	capiutil "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -70,7 +70,7 @@ type NutanixVirtualHADomainReconciler struct {
 	SecretInformer    coreinformers.SecretInformer
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
-	Recorder          record.EventRecorder
+	Recorder          events.EventRecorder
 	controllerConfig  *ControllerConfig
 }
 
@@ -94,7 +94,7 @@ func NewNutanixVirtualHADomainReconciler(client client.Client, secretInformer co
 // SetupWithManager sets up the NutanixVirtualHADomain controller with the Manager.
 func (r *NutanixVirtualHADomainReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("nutanixvirtualhadomain-controller")
+		r.Recorder = mgr.GetEventRecorder("nutanixvirtualhadomain-controller")
 	}
 	copts := controller.Options{
 		MaxConcurrentReconciles: r.controllerConfig.MaxConcurrentReconciles,
