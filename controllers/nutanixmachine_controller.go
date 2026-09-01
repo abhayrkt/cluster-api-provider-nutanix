@@ -37,6 +37,7 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint:staticcheck // suppress complaining on Deprecated package
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -57,6 +58,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/api/v1beta1"
+	nutanixclient "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/pkg/client"
 	nctx "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/pkg/context"
 	prismclientv3 "github.com/nutanix-cloud-native/prism-go-client/v3"
 )
@@ -89,6 +91,7 @@ type NutanixMachineReconciler struct {
 	SecretInformer    coreinformers.SecretInformer
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
+	Recorder          record.EventRecorder
 	controllerConfig  *ControllerConfig
 }
 
@@ -113,6 +116,9 @@ func NewNutanixMachineReconciler(client client.Client, secretInformer coreinform
 func (r *NutanixMachineReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("nutanixmachine-controller")
 	}
 	copts := controller.Options{
 		MaxConcurrentReconciles: r.controllerConfig.MaxConcurrentReconciles,
@@ -271,15 +277,26 @@ func (r *NutanixMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	log.Info(fmt.Sprintf("Reconciling NutanixMachine %s in namespace %s", ntxMachine.Name, ntxMachine.Namespace))
+	deleting := isObjectOrClusterDeleting(ntxMachine, ntxCluster)
+	if result, paused := skipPrismCallsDueToAuthBackoff(ctx, r.Recorder, ntxMachine, ntxCluster, deleting, r.SecretInformer, r.ConfigMapInformer); paused {
+		return result, nil
+	}
+
 	// Create a Nutanix client for the NutanixCluster.
 	v3Client, err := getPrismCentralClientForCluster(ctx, ntxCluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, ntxMachine, ntxCluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central client")
 		return reconcile.Result{}, err
 	}
 
 	convergedClient, err := getPrismCentralConvergedV4ClientForCluster(ctx, ntxCluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, ntxMachine, ntxCluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central converged client")
 		return reconcile.Result{}, err
 	}
@@ -350,6 +367,16 @@ func (r *NutanixMachineReconciler) reconcileDelete(rctx *nctx.MachineContext) (r
 	if err != nil {
 		errorMsg := fmt.Errorf("error finding VM %s with UUID %s: %w", vmName, vmUUID, err)
 		log.Error(errorMsg, "error finding VM")
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, rctx.NutanixMachine, rctx.NutanixCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.PrismCentralAuthenticationFailed, capiv1beta1.ConditionSeverityWarning, "%s", errorMsg.Error())
+			v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
+				Type:    string(infrav1.VMProvisionedCondition),
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.PrismCentralAuthenticationFailed,
+				Message: errorMsg.Error(),
+			})
+			return result, nil
+		}
 		v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.DeletionFailed, capiv1beta1.ConditionSeverityWarning, "%s", errorMsg.Error())
 		v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
 			Type:    string(infrav1.VMProvisionedCondition),
@@ -358,6 +385,9 @@ func (r *NutanixMachineReconciler) reconcileDelete(rctx *nctx.MachineContext) (r
 			Message: errorMsg.Error(),
 		})
 		return reconcile.Result{}, errorMsg
+	}
+	if rctx.NutanixCluster != nil {
+		nutanixclient.PrismAuthCircuit.RecordSuccess(rctx.NutanixCluster.GetNamespacedName())
 	}
 
 	if vm == nil {
@@ -383,6 +413,16 @@ func (r *NutanixMachineReconciler) reconcileDelete(rctx *nctx.MachineContext) (r
 	if err != nil {
 		errorMsg := fmt.Errorf("error occurred while fetching running task from VM: %w", err)
 		log.Error(errorMsg, "error fetching running task from VM")
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, rctx.NutanixMachine, rctx.NutanixCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.PrismCentralAuthenticationFailed, capiv1beta1.ConditionSeverityWarning, "%s", errorMsg.Error())
+			v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
+				Type:    string(infrav1.VMProvisionedCondition),
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.PrismCentralAuthenticationFailed,
+				Message: errorMsg.Error(),
+			})
+			return result, nil
+		}
 		v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.DeletionFailed, capiv1beta1.ConditionSeverityWarning, "%s", errorMsg.Error())
 		v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
 			Type:    string(infrav1.VMProvisionedCondition),
@@ -410,6 +450,16 @@ func (r *NutanixMachineReconciler) reconcileDelete(rctx *nctx.MachineContext) (r
 		if err := r.detachVolumeGroups(rctx, vmName, vmUUID, vm.Disks); err != nil {
 			err := fmt.Errorf("failed to detach volume groups from VM %s with UUID %s: %w", vmName, vmUUID, err)
 			log.Error(err, "failed to detach volume groups from VM")
+			if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, rctx.NutanixMachine, rctx.NutanixCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+				v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.PrismCentralAuthenticationFailed, capiv1beta1.ConditionSeverityWarning, "%s", err.Error())
+				v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
+					Type:    string(infrav1.VMProvisionedCondition),
+					Status:  metav1.ConditionFalse,
+					Reason:  infrav1.PrismCentralAuthenticationFailed,
+					Message: err.Error(),
+				})
+				return result, nil
+			}
 			v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.VolumeGroupDetachFailed, capiv1beta1.ConditionSeverityWarning, "%s", err.Error())
 			v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
 				Type:    string(infrav1.VMProvisionedCondition),
@@ -432,6 +482,16 @@ func (r *NutanixMachineReconciler) reconcileDelete(rctx *nctx.MachineContext) (r
 	if err != nil {
 		err := fmt.Errorf("failed to delete VM %s with UUID %s: %w", vmName, vmUUID, err)
 		log.Error(err, "failed to delete VM")
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, rctx.NutanixMachine, rctx.NutanixCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.PrismCentralAuthenticationFailed, capiv1beta1.ConditionSeverityWarning, "%s", err.Error())
+			v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
+				Type:    string(infrav1.VMProvisionedCondition),
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.PrismCentralAuthenticationFailed,
+				Message: err.Error(),
+			})
+			return result, nil
+		}
 		v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.DeletionFailed, capiv1beta1.ConditionSeverityWarning, "%s", err.Error())
 		v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
 			Type:    string(infrav1.VMProvisionedCondition),
