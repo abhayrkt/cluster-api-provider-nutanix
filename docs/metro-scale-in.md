@@ -43,6 +43,12 @@ Annotations:
 
 CAPI keeps **one MachineSet per template revision**. A rolling upgrade always has at least two. Older revisions can remain until they reach 0 live machines (`revisionHistoryLimit`).
 
+| | MachineSets | Live VMs (MD desired = 4) |
+| --- | --- | --- |
+| **This case (leftover + old + new)** | **3** | **~4 or 5, plus leftover live** (diagram below: leftover 1 + old 4 + new 1 = **6** while desired is 4) |
+| When leftover is empty | **2** | **4 or 5** (surge) |
+| When rollout is done | **1** with VMs (maybe 2 objects) | **4** |
+
 ```mermaid
 flowchart TB
   MD["MachineDeployment workers<br/>spec.replicas = 4<br/>current template = image-v3"]
@@ -158,6 +164,12 @@ If placement used the MD sum (`3A+1B`), the next new VM would mix generations. I
 
 ## Scale-in operator: one reconcile
 
+Each reconcile is **one MachineSet**. It never lists the whole MD.
+
+| | MachineSets this reconcile | Live VMs this reconcile |
+| --- | --- | --- |
+| Scale-in / steady on that set | **1** | That set’s live count only (`spec.replicas` vs live) |
+
 ```mermaid
 flowchart TD
   Start[Reconcile MachineSet] --> FD{failureDomain is<br/>NutanixMetro/* ?}
@@ -201,6 +213,11 @@ Known limitation: if `K` is larger than the imbalance, extra victims in **that s
 
 Placement is **not** the scale-in operator. The NutanixMachine controller picks a failure domain by a greedy least-count simulation over siblings in the **same MachineSet**.
 
+| | MachineSets | Live VMs counted for the new VM |
+| --- | --- | --- |
+| New VM on an existing MS (scale-out) | **1** | Machines already in **that** MS |
+| New VM during upgrade (new MS) | **2** in the MD, placement uses **1** (the new MS) | Only the new MS (starts 0, grows) |
+
 `MachineSet` is preferred over `MachineDeployment` so a surge-first rolling upgrade does not skew the new generation (old machines still up would make MD-level counts look balanced and ties would keep hitting the first FD, e.g. 3–1).
 
 ```mermaid
@@ -229,6 +246,13 @@ Concurrent creates are intended to be safe: NutanixMachine objects exist before 
 ## Rolling upgrade (two MachineSets)
 
 A worker Kubernetes / image upgrade is a MachineDeployment rolling update: **new MachineSet grows, old MachineSet shrinks to 0**.
+
+| | MachineSets | Live VMs (N = 4, image only) |
+| --- | --- | --- |
+| Before | **1** | **4** |
+| During, default surge | **2** | **4 or 5** |
+| During, scale-in strategy | **2** | **3 or 4** |
+| After | **1** with VMs | **4** |
 
 | Strategy | Scale during upgrade | What the balancer sees |
 | --- | --- | --- |
@@ -307,6 +331,14 @@ When the old MachineSet is gone and the new one is balanced, the balancer clears
 ## Image and replica count changed together
 
 CAPI treats that as **one rolling update** to a new MachineSet whose **target size is the new replica count**. It is not “roll the image, then scale.”
+
+| | MachineSets | Live VMs |
+| --- | --- | --- |
+| Before (example start 6) | **1** | **6** |
+| During, image + scale-up 4→6 | **2** | **4** up to **6 or 7**; new MS target **6** |
+| During, image + scale-down 6→4 | **2** | **6** down to **4 or 5**; new MS target **4** |
+| After scale-up | **1** | **6** |
+| After scale-down | **1** | **4** |
 
 ```mermaid
 flowchart LR
