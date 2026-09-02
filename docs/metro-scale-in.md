@@ -294,7 +294,7 @@ flowchart TB
   MSNew --> newGen
 ```
 
-Default surge timeline (example: 4 workers, 2+2, image change only):
+Default surge timeline (example: 4 workers, 2+2, image change only). **This is the same 1-by-1 replacement as a normal CAPI MachineDeployment upgrade** (`maxSurge=1`, `maxUnavailable=0`): create one new VM, drain/delete one old VM, repeat. CAPX does not change that cadence. It only biases **which** old VM each delete step takes (fuller site of the **old** MachineSet).
 
 ```mermaid
 sequenceDiagram
@@ -585,6 +585,8 @@ Step by step:
 7. **Delete the Node, then the Machine** — Only after infra is gone does CAPI delete the Kubernetes Node and release the Machine object.
 
 That is why a leftover revision can still show a VM: `spec.replicas` is already 0, but drain, PDB, volume detach, or Prism delete has not finished. When those complete, the extra VM is gone. No second drain pass from CAPX.
+
+**Same as a normal cluster upgrade** when you only change image/Kubernetes with default strategy: one new Machine, one old Machine draining, live **N or N+1**, until old is empty. Metro does not batch-drain a site and does not replace two old VMs at once unless CAPI itself does (high `maxUnavailable`, pure replica drop, or image+scale-down in one patch).
 
 Skip drain: `Machine.spec.deletion.nodeDrainTimeoutSeconds = 0` or the exclude-node-draining annotation. Then CAPI still deletes the Machine and CAPX still deletes the VM; pods are not evicted first.
 
