@@ -513,6 +513,8 @@ What CAPX does: it still reconciles **each MachineSet alone**. The leftover set 
 
 When the leftover Machine finally gets `deletionTimestamp` and is removed, you drop back to the normal **2** MachineSets of the current rollout (or **1** if that rollout already finished).
 
+**No extra VMs remain at the end.** The leftover is temporary. CAPI already set that MachineSet to 0 replicas; once the last Machine and Prism VM are gone, live workers = `MD.spec.replicas` on the current MachineSet. Surge VMs during a rollout are also temporary (`N` or `N+1`, then back to `N`).
+
 An empty leftover object (`spec=0` and **0** live VMs) is only `revisionHistoryLimit` bookkeeping. That is **not** this case.
 
 ```text
@@ -530,7 +532,7 @@ CAPX never sums these into one pool. Deletes on leftover or old cannot pick a ne
 For every case above, when the MD is Available and revisions have drained:
 
 - **1** MachineSet with live VMs (plus at most `revisionHistoryLimit` empty old MachineSets)
-- **MD.spec.replicas** live worker VMs
+- **MD.spec.replicas** live worker VMs — **not** N+leftover, **not** N+surge. Leftover and surge VMs are gone.
 
 ---
 
