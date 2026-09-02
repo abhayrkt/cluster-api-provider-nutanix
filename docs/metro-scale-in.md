@@ -11,6 +11,8 @@ It covers:
 - Where CAPX can race with CAPI
 - Operational concerns and what is *not* a concern
 
+**Read the [Concerns](#concerns) section before relying on this in production.** The important ones: CAPI can delete **one** machine on the wrong site per rolling step before CAPX annotates; the balancer does **not** watch Secrets or CAPI delete events; `maxUnavailable > 0` plus Newest/Random can dump a whole site; placement isolation is **per MachineSet name**, so a single-MS in-place replica change can still skew.
+
 Related code:
 
 - Scale-in balancer: `controllers/nutanixmetro_scaledown_controller.go`
