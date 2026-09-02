@@ -1,0 +1,521 @@
+# Metro scale-in balancer and placement during scale, upgrade, and rollout
+
+This document describes how CAPX keeps a **stretched `NutanixMetro` worker pool** balanced across two Prism Element sites when CAPI scales, upgrades, or rolls a `MachineDeployment`.
+
+It covers:
+
+- The scale-in operator (`MetroScaleDownBalancerReconciler`)
+- Metro VM placement on create (`computeMetroPlacementIndex`)
+- One vs many `MachineSet`s under the same `MachineDeployment`
+- Changing image and replica count at the same time
+- Where CAPX can race with CAPI
+
+Related code:
+
+- Scale-in balancer: `controllers/nutanixmetro_scaledown_controller.go`
+- Placement: `controllers/nutanixmachine_controller.go` (`computeMetroPlacementIndex`, `metroPlacementGroupOwnerLabels`)
+
+## Why this exists
+
+A worker pool on a stretched `NutanixMetro` exposes a **single** `spec.failureDomain` (`NutanixMetro/<name>`) to CAPI. CAPI’s `MachineSet` delete policy is **site-blind**. Without a bias, scale-down or rolling upgrade can delete one site first, starve that Prism Element, and (on Rook-Ceph clusters) wedge OSD scheduling.
+
+CAPX does **not** delete machines. CAPI still owns replica math and deletion.
+
+| Component | Role |
+| --- | --- |
+| Scale-in balancer | Sets `cluster.x-k8s.io/delete-machine` on machines of the **fuller site** of **one MachineSet** so CAPI deletes those first |
+| Placement | Picks the native failure domain for **new** VMs, scoped to the machine’s **MachineSet** (not the whole MD) |
+
+The balancer only runs when `MachineSet.spec.template.spec.failureDomain` is `NutanixMetro/...`. `NutanixMetroSite` pools and non-metro pools are ignored. Control-plane machines are not handled by this operator.
+
+Annotations:
+
+- `cluster.x-k8s.io/delete-machine` — CAPI’s documented top-priority delete signal
+- `metro.nutanix.com/managed-delete-machine` — marks annotations this controller owns so operator-set `delete-machine` is never cleared
+
+---
+
+## One MachineDeployment, many MachineSets
+
+CAPI keeps **one MachineSet per template revision**. A rolling upgrade always has at least two. Older revisions can remain until they reach 0 live machines (`revisionHistoryLimit`).
+
+```mermaid
+flowchart TB
+  MD["MachineDeployment workers<br/>spec.replicas = 4<br/>current template = image-v3"]
+
+  MS1["MachineSet workers-rev1<br/>image-v1<br/>spec.replicas = 0<br/>possible leftover live machines"]
+  MS2["MachineSet workers-rev2<br/>image-v2<br/>OLD — scaling to 0"]
+  MS3["MachineSet workers-rev3<br/>image-v3<br/>NEW — scaling to 4"]
+
+  MD --> MS1
+  MD --> MS2
+  MD --> MS3
+
+  subgraph iso [Each MachineSet is an isolated metro group]
+    B1["Balancer reconcile MS1"]
+    B2["Balancer reconcile MS2"]
+    B3["Balancer reconcile MS3"]
+    P1["Placement group = MS1 name"]
+    P2["Placement group = MS2 name"]
+    P3["Placement group = MS3 name"]
+  end
+
+  MS1 --> B1
+  MS1 --> P1
+  MS2 --> B2
+  MS2 --> P2
+  MS3 --> B3
+  MS3 --> P3
+```
+
+CAPX never adds MachineSets together and rebalances the MD as one pool.
+
+What each set does:
+
+```mermaid
+flowchart LR
+  subgraph MS2old [MachineSet rev2 — shrinking]
+    L2["Live: 2A + 2B old image"]
+    R2["spec.replicas = 3 this step"]
+    K2["pendingDelete = 1"]
+    V2["Annotate 1 victim on fuller site of THIS set"]
+    L2 --> R2 --> K2 --> V2
+  end
+
+  subgraph MS3new [MachineSet rev3 — growing]
+    L3["Live: 1A + 0B new image"]
+    R3["spec.replicas = 2 this step"]
+    K3["pendingDelete = 0"]
+    P3["Placement: next new VM → site B<br/>counts only rev3"]
+    L3 --> R3 --> K3 --> P3
+  end
+
+  subgraph MS1dead [MachineSet rev1 — leftover]
+    L1["Live: 1A leftover"]
+    R1["spec.replicas = 0"]
+    K1["pendingDelete = 1"]
+    V1["Annotate that leftover on rev1 only"]
+    L1 --> R1 --> K1 --> V1
+  end
+```
+
+A `delete-machine` annotation on rev2 never selects a rev3 machine. A new VM for rev3 never uses rev2 site counts.
+
+```mermaid
+sequenceDiagram
+  participant MD as MachineDeployment
+  participant MS1 as MS rev1 leftover
+  participant MS2 as MS rev2 old
+  participant MS3 as MS rev3 new
+  participant Bal as Scale-in balancer
+  participant Place as Placement
+  participant CAPI as CAPI MachineSet delete
+
+  Note over MD,MS3: Same MD. Three MachineSets at once.
+
+  MD->>MS3: Ramp replicas up toward MD.spec.replicas
+  Place->>MS3: Place using only machines with set-name=rev3
+
+  MD->>MS2: Ramp replicas down toward 0
+  Bal->>MS2: List machines with set-name=rev2
+  Bal->>MS2: Mark delete-machine on fuller rev2 site
+  CAPI->>MS2: Delete only rev2 annotated machines
+
+  opt rev1 still has live machines
+    MD->>MS1: replicas already 0
+    Bal->>MS1: pendingDelete = leftover live
+    CAPI->>MS1: Delete leftover rev1 machines
+  end
+
+  Note over MS1,MS3: Balancer runs once per MachineSet, never across them
+```
+
+Site counts stay per MachineSet (example: MD desired = 4, sites A/B):
+
+```mermaid
+flowchart TB
+  subgraph cluster [Looks uneven if you sum the MD]
+    Sum["MD live total:<br/>rev2 2A+1B plus rev3 1A+0B = 3A+1B"]
+  end
+
+  subgraph actual [What CAPX actually uses]
+    R2["rev2 balancer: 2A vs 1B<br/>next old delete comes from A"]
+    R3["rev3 placement: 1A vs 0B<br/>next new VM goes to B"]
+  end
+
+  cluster --> actual
+  R2 --> Out2["Old set stays as even as each delete allows"]
+  R3 --> Out3["New set grows 1A+1B then 2A+2B"]
+```
+
+If placement used the MD sum (`3A+1B`), the next new VM would mix generations. It does not.
+
+---
+
+## Scale-in operator: one reconcile
+
+```mermaid
+flowchart TD
+  Start[Reconcile MachineSet] --> FD{failureDomain is<br/>NutanixMetro/* ?}
+  FD -->|no| Skip[No-op]
+  FD -->|yes| Pause{Cluster or MS paused<br/>or MS deleting?}
+  Pause -->|yes| Skip
+  Pause -->|no| List[List live machines in THIS MachineSet]
+  List --> Site[Group by native site label<br/>metro.nutanix.com/native-failuredomain]
+  Site --> Pend{spec.replicas &lt; live count?}
+  Pend -->|yes: scale-in in progress| K["K = pending deletes<br/>live − replicas"]
+  Pend -->|no: steady state| E["K = site excess<br/>larger − smaller"]
+  K --> Greedy[Each step: pick newest machine<br/>on the currently larger site]
+  E --> Greedy
+  Greedy --> Patch["Set delete-machine on victims<br/>Clear only annotations this controller owns"]
+  Patch --> Done[Return — CAPI performs the actual delete]
+```
+
+Watch / enqueue:
+
+```mermaid
+flowchart TD
+  Watch[Watch: MachineSet, Machine, Cluster] --> Enq[Enqueue that MachineSet only]
+  Enq --> Rec[Reconcile one MS]
+  Rec --> Filter{This MS template.failureDomain<br/>is NutanixMetro/* ?}
+  Filter -->|no| Skip[Ignore this MS]
+  Filter -->|yes| Live[Live machines with<br/>label set-name = this MS]
+  Live --> Cmp{replicas vs live}
+  Cmp -->|live > replicas| ScaleIn["Scale-in path<br/>K = live − replicas<br/>victims from fuller site of THIS MS"]
+  Cmp -->|live ≤ replicas| Steady["Steady / scale-out path<br/>K = excess only<br/>no pending CAPI deletes"]
+  ScaleIn --> Ann[Patch delete-machine on this MS's machines]
+  Steady --> Ann2[Clear our annotations if no longer victims]
+```
+
+Machines without a native-site label yet are skipped for counting (`ok=false`) and reconsidered once placement records the label.
+
+Known limitation: if `K` is larger than the imbalance, extra victims in **that same batch** fall back to CAPI’s site-blind policy. The next reconcile re-marks. This cannot re-create a full one-sided collapse for normal step-by-step scale-downs.
+
+---
+
+## Placement of new machines
+
+Placement is **not** the scale-in operator. The NutanixMachine controller picks a failure domain by a greedy least-count simulation over siblings in the **same MachineSet**.
+
+`MachineSet` is preferred over `MachineDeployment` so a surge-first rolling upgrade does not skew the new generation (old machines still up would make MD-level counts look balanced and ties would keep hitting the first FD, e.g. 3–1).
+
+```mermaid
+flowchart TB
+  subgraph wrong [If grouped by MachineDeployment]
+    W1["Old still 2A+2B live"]
+    W2["New VM sees counts already balanced"]
+    W3["Tie → always first FD"]
+    W4["New generation skews e.g. 3A+1B"]
+    W1 --> W2 --> W3 --> W4
+  end
+
+  subgraph right [Grouped by MachineSet — actual code]
+    R1["Old MS counts ignored"]
+    R2["New MS starts 0+0"]
+    R3["New VMs fill emptier site"]
+    R4["New generation ~even, e.g. 2A+2B"]
+    R1 --> R2 --> R3 --> R4
+  end
+```
+
+Concurrent creates are intended to be safe: NutanixMachine objects exist before reconcile, siblings are listed with `APIReader`, pending names are sorted, and every reconciler runs the same simulation so each machine gets a distinct slot. Terminating machines are skipped so in-flight deletes free a slot.
+
+---
+
+## Rolling upgrade (two MachineSets)
+
+A worker Kubernetes / image upgrade is a MachineDeployment rolling update: **new MachineSet grows, old MachineSet shrinks to 0**.
+
+| Strategy | Scale during upgrade | What the balancer sees |
+| --- | --- | --- |
+| Default rolling (`maxSurge=1`, `maxUnavailable=0`) | Create one new machine, then delete one old | Old MS: `replicas < live` → pending scale-in. New MS: scaling up |
+| Scale-in (`maxSurge=0`, `maxUnavailable=1`) | Delete first, then create | Old MS shrinks first; new MS grows as slots free |
+
+```mermaid
+flowchart TB
+  MD["MachineDeployment workers<br/>replicas = N (new desired)<br/>template = new image"]
+
+  MSOld["MachineSet workers-old<br/>template = old image<br/>spec.replicas → 0"]
+  MSNew["MachineSet workers-new<br/>template = new image<br/>spec.replicas → N"]
+
+  MD --> MSOld
+  MD --> MSNew
+
+  subgraph oldGen [Old generation — scale-in operator]
+    O1["Machines on site A"]
+    O2["Machines on site B"]
+    BalOld["MetroScaleDownBalancer<br/>reconciles THIS set only"]
+    Ann["cluster.x-k8s.io/delete-machine<br/>on fuller site"]
+    CAPIOld["CAPI MachineSet controller<br/>deletes annotated machines"]
+    O1 --> BalOld
+    O2 --> BalOld
+    BalOld --> Ann
+    Ann --> CAPIOld
+  end
+
+  subgraph newGen [New generation — placement]
+    Place["NutanixMachine placement<br/>group key = MachineSet name"]
+    NA["New VMs spread on site A"]
+    NB["New VMs spread on site B"]
+    Place --> NA
+    Place --> NB
+  end
+
+  MSOld --> oldGen
+  MSNew --> newGen
+```
+
+Default surge timeline (example: 4 workers, 2+2, image change only):
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant User
+  participant MD as MachineDeployment
+  participant Old as MachineSet old
+  participant New as MachineSet new
+  participant Place as Metro placement
+  participant Bal as Scale-in balancer
+  participant CAPI as CAPI delete
+
+  User->>MD: Change image
+  MD->>New: Create new MS (replicas ramp up)
+  Place->>New: Place first new VM on emptier site<br/>(counts only new MS)
+  Note over Old,New: Live total can be 5 (4 + surge)
+
+  MD->>Old: replicas 4 → 3
+  Bal->>Old: pendingDelete=1 → annotate fuller old site
+  CAPI->>Old: Delete annotated old machine
+
+  loop Until old=0 and new=4
+    Place->>New: Place next new VM in new MS only
+    Bal->>Old: Re-mark remaining old machines
+    CAPI->>Old: Delete next annotated old machine
+  end
+```
+
+The operator is **not** disabled for the upgrade. It does **not** special-case upgrade vs scale-down. A paused Cluster/MachineSet is a no-op.
+
+When the old MachineSet is gone and the new one is balanced, the balancer clears its own annotations. Steady state is unmarked machines.
+
+---
+
+## Image and replica count changed together
+
+CAPI treats that as **one rolling update** to a new MachineSet whose **target size is the new replica count**. It is not “roll the image, then scale.”
+
+```mermaid
+flowchart LR
+  subgraph before [Before]
+    B["MD replicas=6<br/>one MS: 3A + 3B<br/>old image"]
+  end
+
+  subgraph during [During rollout — two MachineSets]
+    Old["Old MS → 0<br/>balancer picks deletes<br/>per old-MS site counts"]
+    NewUp["Scale up 6→8:<br/>new MS target = 8<br/>placement balances new MS"]
+    NewDown["Scale down 6→4:<br/>new MS target = 4<br/>old still goes to 0 in steps"]
+  end
+
+  subgraph after [After]
+    AUp["One MS: ~4A + 4B<br/>new image"]
+    ADown["One MS: ~2A + 2B<br/>new image"]
+  end
+
+  before --> during
+  NewUp --> AUp
+  NewDown --> ADown
+```
+
+| MachineSet | Image + scale **up** (4→6) | Image + scale **down** (6→4) |
+| --- | --- | --- |
+| **Old** | Still shrinks to 0. Balancer marks victims on the fuller **old** site | Same: old set still goes to 0 |
+| **New** | Grows toward 6. Placement balances the **new** set only | Grows toward 4. Not mixed with old |
+
+Scale-down + image, default surge (`maxUnavailable=0` keeps at least the new desired count available):
+
+```mermaid
+flowchart TD
+  S0["Start: old 3A+3B, desired MD=4, new image"]
+  S1["Create 1 new VM<br/>placement: new MS only"]
+  S2["Old MS replicas drop by 1<br/>balancer: 1 victim on fuller old site"]
+  S3["CAPI deletes that old machine"]
+  S4{old MS = 0 and new = 4?}
+  S0 --> S1 --> S2 --> S3 --> S4
+  S4 -->|no| S1
+  S4 -->|yes| Done["Single MS left, annotations cleared"]
+```
+
+CAPI does **not** dump all old machines in one shot when `maxUnavailable=0`. Each old-MS step usually has `pendingDelete` of 1. If `maxUnavailable` is large, many old replicas can drop in one update; extra victims after balance in that batch are site-blind until the next reconcile.
+
+---
+
+## Races with CAPI
+
+CAPX never deletes machines. The only structural race is **timing**: CAPI can act on `MachineSet.spec.replicas` (create or delete) **before** CAPX has patched `delete-machine` or finished placement. After each CAPI action, CAPX reconciles again.
+
+### Shared race: CAPI is faster than the annotation
+
+```mermaid
+sequenceDiagram
+  participant MD as CAPI MachineDeployment
+  participant MS as CAPI MachineSet
+  participant Bal as CAPX scale-in balancer
+  participant M as Machine
+
+  MD->>MS: spec.replicas = live-1
+  par CAPI delete path
+    MS->>MS: getMachinesToDeletePrioritized()
+    Note over MS: delete-machine not set yet<br/>falls back to Newest/Random<br/>site-blind
+    MS->>M: set deletionTimestamp
+  and CAPX annotate path
+    Bal->>M: list live machines
+    Bal->>M: patch delete-machine on fuller site
+  end
+```
+
+If CAPI wins, that **one step** can delete the “wrong” site. CAPX then re-marks the remainder. Later steps pull back toward even.
+
+### Pure scale-down (one MachineSet)
+
+| Race | What happens | Outcome |
+| --- | --- | --- |
+| Annotate vs delete | CAPI scales MS down before `delete-machine` exists | That victim can be site-blind. Next reconcile marks the fuller site |
+| Large `pendingDelete` in one step | MD/MS drops many replicas at once | Extra victims in the same batch after balance are CAPI-policy |
+| Placement label not set yet | Machine has no `metro.nutanix.com/native-failuredomain` | Balancer skips it. CAPI can still delete it. Site counts under-count |
+| Informer cache lag | Balancer uses cache, not APIReader | Can mark from a stale live set. Machine watch requeues |
+| Patch conflict | CAPI updates Machine status while CAPX patches annotations | Conflict-safe patch retries; else next reconcile |
+
+CAPX does not fight CAPI replica math. It only orders **which** machines those replicas delete.
+
+### Rolling upgrade (two MachineSets)
+
+```mermaid
+sequenceDiagram
+  participant MD as MachineDeployment
+  participant Old as MachineSet old
+  participant New as MachineSet new
+  participant Place as CAPX placement
+  participant Bal as CAPX balancer
+  participant CAPI as CAPI MS controller
+
+  MD->>New: create + raise replicas (surge)
+  Place->>New: pick site using only new MS
+  MD->>Old: lower replicas
+  Note over Old,CAPI: Race: CAPI may delete old machine<br/>before balancer annotates
+  CAPI->>Old: delete (maybe site-blind this step)
+  Bal->>Old: re-mark remaining old machines
+```
+
+| Race | Scenario | Outcome |
+| --- | --- | --- |
+| Annotate vs delete on **old** MS | Every scale-in step of the old revision | One old machine may come off the wrong site; new MS is untouched |
+| Surge create vs old delete | `maxSurge=1`: create new, then delete old | Placement and balancer use **different MachineSets** — they do not pick the same machine |
+| Old machines still Running | If placement used MD, old 2+2 would hide new-MS imbalance | Designed out: group key is MachineSet name |
+
+### Multiple MachineSets for one MD
+
+```mermaid
+flowchart TB
+  MD[MD workers]
+  MS1[MS rev1 leftover replicas=0]
+  MS2[MS rev2 scaling to 0]
+  MS3[MS rev3 scaling to N]
+  MD --> MS1
+  MD --> MS2
+  MD --> MS3
+
+  CAPI1[CAPI deletes rev1 leftovers]
+  CAPI2[CAPI deletes rev2]
+  CAPI3[CAPI creates rev3]
+  B1[Balancer rev1]
+  B2[Balancer rev2]
+  B3[Balancer rev3 / placement]
+
+  MS1 --> B1 --> CAPI1
+  MS2 --> B2 --> CAPI2
+  MS3 --> B3 --> CAPI3
+```
+
+| Race | Scenario | Outcome |
+| --- | --- | --- |
+| Three CAPI loops in parallel | MD scales rev3 up, rev2 down, rev1 leftovers to 0 | Three independent annotate-vs-delete races. A bad delete on rev2 cannot take a rev3 VM |
+| Leftover revision `replicas=0` with 1 live machine | `pendingDelete = leftover` | CAPI may delete before annotation; only one machine |
+
+### Image and replicas together
+
+**Scale-up + new image (4→8)**
+
+| Race | Outcome |
+| --- | --- |
+| Many creates on the new MS | Concurrent NutanixMachine reconciles. Mitigated by same sibling list + name sort + APIReader. Residual: a machine listed before its sibling exists can double-pick a site; later unplaced machines fill the hole |
+| Old MS still deleting | Isolated by MachineSet. Worst case: one-sided delete for one old-MS step |
+
+**Scale-down + new image (6→4)**
+
+| Race | Outcome |
+| --- | --- |
+| Annotate vs delete on old MS | Same as upgrade |
+| Large `maxUnavailable` | Several old replicas drop in one MS spec update → extra victims after balance are site-blind **for that batch** |
+
+### Placement vs CAPI create
+
+```mermaid
+sequenceDiagram
+  participant MS as CAPI MachineSet
+  participant M as Machine + NutanixMachine
+  participant P1 as CAPX reconcile machine-a
+  participant P2 as CAPX reconcile machine-b
+
+  MS->>M: create two Machines (scale-up or surge)
+  par
+    P1->>P1: API list siblings, sort names, greedy slot
+  and
+    P2->>P2: same list, same sort, same slots
+  end
+  Note over P1,P2: Same pending set → a and b get different FDs
+```
+
+| Race | Scenario | Outcome |
+| --- | --- | --- |
+| Sibling not in API yet | machine-a reconciles before machine-b exists | Both may pick site A. Next unplaced machine goes to B |
+| Delete in flight, label still present | Terminating NutanixMachine not skipped yet | New VM may avoid a site that is about to free; then self-heal |
+
+Placement never sets `delete-machine`.
+
+### Other scenarios
+
+| Scenario | Race with CAPI |
+| --- | --- |
+| Cluster paused mid-rollout | Balancer no-ops. If Cluster is paused, CAPI MD/MS should pause too |
+| Operator already set `delete-machine` | CAPX never clears it. CAPI deletes that machine first (operator intent can fight balance) |
+| MachineHealthCheck / remediation | CAPI can delete without an MS replica change. Balancer does not choose the victim. Next scale-in re-marks from the new counts |
+| Cluster autoscaler | Scale-up: sibling placement race. Scale-down: same annotate-vs-delete, often 1 replica at a time |
+| Control-plane upgrade | This operator does **not** run. KCP scale-in is CAPI-only |
+
+### What is not a race
+
+- CAPX and CAPI choosing which MachineSet shrinks — MD owns replica math
+- Two MachineSets stealing each other’s victims — deletes are per MachineSet
+- CAPX rolling back a CAPI deletion — once `deletionTimestamp` is set, the balancer skips that machine
+
+### Practical severity
+
+| How often CAPI wins annotate-vs-delete | Typical impact |
+| --- | --- |
+| Default `maxUnavailable=0`, `maxSurge=1` (1 delete per step) | At most **one** wrong-site delete per step; next step corrects |
+| Big replica drop or high `maxUnavailable` | One batch can unbalance more; later batches correct |
+| First machines in a new MS | Placement off-by-one if creates are staggered; later machines fill the hole |
+
+---
+
+## Summary
+
+| Question | Answer |
+| --- | --- |
+| How many MachineSets can one MD have? | One per revision; 2 during a normal rollout; 3+ if an older revision still has machines |
+| Does the scale-in operator merge them? | No |
+| Can an old MS delete a new-MS machine? | No |
+| Do new VMs balance against old VMs still up? | No — placement key is MachineSet name |
+| Does changing image and replicas together disable the balancer? | No. Old set scales to 0 toward the new size; new set is born targeting that size |
+| Main race with CAPI? | MachineSet controller can delete (site-blind) before `delete-machine` is visible |
+| When is there one MS again? | After older revisions have 0 live machines and are removed |
