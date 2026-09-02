@@ -472,12 +472,51 @@ After:   1 MachineSet with 4 VMs
 
 Old `spec.replicas` can drop by **more than 1** in one MachineDeployment reconcile when the MD itself scaled down (see Concerns). That is still **2** MachineSets, not 1.
 
-### Three MachineSets
+### Three MachineSets (leftover old revision still has a VM)
 
-Only when an **older** revision still has machines (or a second rollout starts before the previous old MS is gone):
+This is **not** the normal two-MS upgrade. It is what you see when a **previous** revision was already scaled to `spec.replicas = 0` but **CAPI has not finished deleting its last Machine** (slow drain, PDB, stuck node, Prism VM delete taking time), and a **new** rollout has already started.
+
+How you get there (example: desired always 4):
 
 ```text
-MS leftover  spec=0, live=1     (or 0 live, object only)
+1. Steady:           1 MS (image-v1), 4 VMs
+2. Upgrade v1 → v2:  2 MS. v2 grows to 4, v1 spec → 0
+3. Almost done:      v2 has 4 VMs. v1 spec = 0 but 1 VM still live.
+                     That v1 VM is the leftover.
+                     Live total = 4 (current) + 1 (leftover) = 5
+                     MachineSets with live VMs = 2
+4. Another upgrade v2 → v3 starts before that leftover VM is gone:
+                     3 MachineSets with live VMs
+                     leftover v1: spec 0, live 1
+                     old v2:      shrinking toward 0
+                     new v3:      growing toward 4
+                     Live total ≈ 4 or 5 (v2+v3 surge)  +  1 leftover
+```
+
+```mermaid
+flowchart TB
+  subgraph t3 [Step 3 — leftover, no second rollout yet]
+    A["MS v2: 4 VMs, current"]
+    B["MS v1: spec=0, 1 VM still up"]
+    C["MachineSets with VMs: 2<br/>Live VMs: 5"]
+  end
+  subgraph t4 [Step 4 — second rollout while leftover remains]
+    D["MS v1 leftover: spec=0, live=1"]
+    E["MS v2 old: shrinking"]
+    F["MS v3 new: growing"]
+    G["MachineSets with VMs: 3<br/>Live VMs: ~4 or 5 plus the leftover"]
+  end
+  t3 --> t4
+```
+
+What CAPX does: it still reconciles **each MachineSet alone**. The leftover set has `pendingDelete = live − 0`, so the balancer only annotates that leftover VM. It does **not** count that VM when placing v3 or when picking v2 deletes. CAPI is already trying to delete it; the leftover is extra capacity, not part of `MD.spec.replicas`.
+
+When the leftover Machine finally gets `deletionTimestamp` and is removed, you drop back to the normal **2** MachineSets of the current rollout (or **1** if that rollout already finished).
+
+An empty leftover object (`spec=0` and **0** live VMs) is only `revisionHistoryLimit` bookkeeping. That is **not** this case.
+
+```text
+MS leftover  spec=0, live=1     (this case)
 MS old       spec shrinking, live catching up
 MS new       spec growing toward N
 Live VMs     ≈ N or N+1  + leftover live
