@@ -10,6 +10,7 @@ It covers:
 - Changing image and replica count at the same time
 - Where CAPX can race with CAPI
 - [How many MachineSets and VMs](#how-many-machinesets-and-vms) in each case
+- [How draining happens](#how-draining-happens) (CAPI, not CAPX)
 - Operational concerns and what is *not* a concern
 
 **Read the [Concerns](#concerns) section before relying on this in production.** The important ones: CAPI can delete **one** machine on the wrong site per rolling step before CAPX annotates; the balancer does **not** watch Secrets or CAPI delete events; `maxUnavailable > 0` plus Newest/Random can dump a whole site; placement isolation is **per MachineSet name**, so a single-MS in-place replica change can still skew.
@@ -533,6 +534,59 @@ For every case above, when the MD is Available and revisions have drained:
 
 - **1** MachineSet with live VMs (plus at most `revisionHistoryLimit` empty old MachineSets)
 - **MD.spec.replicas** live worker VMs — **not** N+leftover, **not** N+surge. Leftover and surge VMs are gone.
+
+---
+
+## How draining happens
+
+CAPX does **not** drain nodes. The metro balancer only sets `cluster.x-k8s.io/delete-machine`. “Drain the fuller site” in that controller means **which VM CAPI should delete first**, not kubelet drain.
+
+Node drain is **CAPI’s Machine controller**, after CAPI has already decided to delete that Machine.
+
+```mermaid
+sequenceDiagram
+  participant Bal as CAPX metro balancer
+  participant MS as CAPI MachineSet
+  participant M as CAPI Machine
+  participant Drain as CAPI Machine controller
+  participant WL as Workload cluster
+  participant NM as CAPX NutanixMachine
+  participant PC as Prism Central
+
+  Note over Bal,MS: Only when this MachineSet has live > spec.replicas
+  Bal->>M: Annotate delete-machine on fuller-site victim
+  MS->>M: DELETE Machine (deletionTimestamp)
+  Drain->>Drain: Wait for pre-drain hooks if any
+  Drain->>WL: Cordon Node
+  Drain->>WL: Evict pods (PDBs, MachineDrainRules)
+  Note over Drain,WL: Requeue ~20s until pods gone or NodeDrainTimeout
+  Drain->>WL: Wait for volume detach
+  Drain->>Drain: Wait for pre-terminate hooks if any
+  Drain->>NM: Delete NutanixMachine
+  NM->>PC: Delete VM (after VG detach if needed)
+  Drain->>WL: Delete Node object
+  Note over M: Machine finalizers drop; object gone
+```
+
+Step by step:
+
+1. **Pick the victim** — MachineSet `spec.replicas` is below live count. CAPI’s MachineSet controller calls `Delete` on N machines. Priority: already-deleting, then `delete-machine` (what CAPX set), then in-place-updating, then unhealthy, then Newest/Random. CAPX is not in this loop.
+
+2. **Machine gets `deletionTimestamp`** — From here the metro balancer **skips** that Machine (it is not live). The leftover case is a Machine that is still in this pipeline.
+
+3. **Pre-drain hooks** — If the Machine has annotations under `pre-drain.delete.hook.machine.cluster.x-k8s.io/`, CAPI waits until those annotations are removed. CAPX does not set these.
+
+4. **Cordon + drain** — Unless `cluster.x-k8s.io/exclude-node-draining` is set or `nodeDrainTimeout` has expired, CAPI cordons the workload Node and evicts pods (same idea as `kubectl drain`). Evictions honor PodDisruptionBudgets and CAPI `MachineDrainRules`. Incomplete drain requeues about every **20s**. Unreachable kubelet uses a short grace period and skips old terminating pods.
+
+5. **Volume detach** — After drain, CAPI waits until the Node has no attached volumes (unless excluded or timeout). Then **pre-terminate** hooks, if any.
+
+6. **Delete the VM** — CAPI deletes the `NutanixMachine`. CAPX `reconcileDelete` waits for in-progress Prism tasks, detaches volume groups if needed, then `VMs.DeleteAsync`. It requeues until the VM is gone, then drops its finalizer.
+
+7. **Delete the Node, then the Machine** — Only after infra is gone does CAPI delete the Kubernetes Node and release the Machine object.
+
+That is why a leftover revision can still show a VM: `spec.replicas` is already 0, but drain, PDB, volume detach, or Prism delete has not finished. When those complete, the extra VM is gone. No second drain pass from CAPX.
+
+Skip drain: `Machine.spec.deletion.nodeDrainTimeoutSeconds = 0` or the exclude-node-draining annotation. Then CAPI still deletes the Machine and CAPX still deletes the VM; pods are not evicted first.
 
 ---
 
