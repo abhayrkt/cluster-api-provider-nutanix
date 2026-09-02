@@ -46,6 +46,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
@@ -396,8 +397,9 @@ func TestNutanixMachineReconciler_SetupWithManager(t *testing.T) {
 	mgr.EXPECT().GetAPIReader().Return(mockClient).AnyTimes()
 
 	reconciler := &NutanixMachineReconciler{
-		Client: mockClient,
-		Scheme: scheme,
+		Client:   mockClient,
+		Scheme:   scheme,
+		Recorder: events.NewFakeRecorder(1),
 		controllerConfig: &ControllerConfig{
 			MaxConcurrentReconciles: 1,
 			SkipNameValidation:      true, // Enable for tests
@@ -442,8 +444,9 @@ func TestNutanixMachineReconciler_SetupWithManager_BuildError(t *testing.T) {
 	mgr.EXPECT().GetAPIReader().Return(mockClient).AnyTimes()
 
 	reconciler := &NutanixMachineReconciler{
-		Client: mockClient,
-		Scheme: scheme,
+		Client:   mockClient,
+		Scheme:   scheme,
+		Recorder: events.NewFakeRecorder(1),
 		controllerConfig: &ControllerConfig{
 			MaxConcurrentReconciles: 1,
 		},
@@ -487,8 +490,9 @@ func TestNutanixMachineReconciler_SetupWithManager_ClusterToTypedObjectsMapperEr
 	mgr.EXPECT().GetAPIReader().Return(mockClient).AnyTimes()
 
 	reconciler := &NutanixMachineReconciler{
-		Client: mockClient,
-		Scheme: scheme,
+		Client:   mockClient,
+		Scheme:   scheme,
+		Recorder: events.NewFakeRecorder(1),
 		controllerConfig: &ControllerConfig{
 			MaxConcurrentReconciles: 1,
 		},

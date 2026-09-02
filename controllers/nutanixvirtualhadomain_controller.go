@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	capiutil "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -69,6 +70,7 @@ type NutanixVirtualHADomainReconciler struct {
 	SecretInformer    coreinformers.SecretInformer
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
+	Recorder          events.EventRecorder
 	controllerConfig  *ControllerConfig
 }
 
@@ -91,6 +93,9 @@ func NewNutanixVirtualHADomainReconciler(client client.Client, secretInformer co
 
 // SetupWithManager sets up the NutanixVirtualHADomain controller with the Manager.
 func (r *NutanixVirtualHADomainReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("nutanixvirtualhadomain-controller")
+	}
 	copts := controller.Options{
 		MaxConcurrentReconciles: r.controllerConfig.MaxConcurrentReconciles,
 		RateLimiter:             r.controllerConfig.RateLimiter,
@@ -182,13 +187,24 @@ func (r *NutanixVirtualHADomainReconciler) Reconcile(ctx context.Context, req ct
 		}
 	}
 
+	deleting := isObjectOrClusterDeleting(vHADomain, ntnxCluster)
+	if result, paused := skipPrismCallsDueToAuthBackoff(ctx, r.Recorder, vHADomain, ntnxCluster, deleting, r.SecretInformer, r.ConfigMapInformer); paused {
+		return result, nil
+	}
+
 	v3Client, err := getPrismCentralClientForCluster(ctx, ntnxCluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, vHADomain, ntnxCluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central client")
 		return reconcile.Result{}, err
 	}
 	convergedClient, err := getPrismCentralConvergedV4ClientForCluster(ctx, ntnxCluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, vHADomain, ntnxCluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central converged client")
 		return reconcile.Result{}, err
 	}
@@ -208,9 +224,14 @@ func (r *NutanixVirtualHADomainReconciler) Reconcile(ctx context.Context, req ct
 	// until all owned vHADomains have been deleted.
 	if !vHADomain.DeletionTimestamp.IsZero() {
 		if err = r.reconcileDelete(rctx); err != nil {
+			if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, vHADomain, ntnxCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+				return result, nil
+			}
 			log.Error(err, "failed at deletion reconciling")
+			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, err
+		nutanixclient.PrismAuthCircuit.RecordSuccess(ntnxCluster.GetNamespacedName())
+		return ctrl.Result{}, nil
 	}
 
 	if err = r.reconcileNormal(rctx); err != nil {

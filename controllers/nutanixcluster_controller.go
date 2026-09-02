@@ -30,6 +30,7 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 	kutilerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint:staticcheck // suppress complaining on Deprecated package
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -59,6 +60,7 @@ type NutanixClusterReconciler struct {
 	SecretInformer    coreinformers.SecretInformer
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
+	Recorder          events.EventRecorder
 	controllerConfig  *ControllerConfig
 }
 
@@ -80,6 +82,9 @@ func NewNutanixClusterReconciler(client client.Client, secretInformer coreinform
 
 // SetupWithManager sets up the NutanixCluster controller with the Manager.
 func (r *NutanixClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("nutanixcluster-controller")
+	}
 	copts := controller.Options{
 		MaxConcurrentReconciles: r.controllerConfig.MaxConcurrentReconciles,
 		RateLimiter:             r.controllerConfig.RateLimiter,
@@ -144,6 +149,8 @@ func (r *NutanixClusterReconciler) mapNutanixFailureDomainToNutanixCluster() han
 }
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;update;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=nutanixclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=nutanixclusters/status,verbs=get;update;patch
@@ -239,13 +246,24 @@ func (r *NutanixClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return reconcile.Result{}, err
 	}
 
+	deleting := isObjectOrClusterDeleting(cluster, cluster)
+	if result, paused := skipPrismCallsDueToAuthBackoff(ctx, r.Recorder, cluster, cluster, deleting, r.SecretInformer, r.ConfigMapInformer); paused {
+		return result, nil
+	}
+
 	v3Client, err := getPrismCentralClientForCluster(ctx, cluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, cluster, cluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central client")
 		return reconcile.Result{}, err
 	}
 	convergedClient, err := getPrismCentralConvergedV4ClientForCluster(ctx, cluster, r.SecretInformer, r.ConfigMapInformer)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(ctx, r.Recorder, cluster, cluster, deleting, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while fetching prism central converged client")
 		return reconcile.Result{}, err
 	}
@@ -310,9 +328,13 @@ func (r *NutanixClusterReconciler) reconcileDelete(rctx *nctx.ClusterContext) (r
 
 	err = r.reconcileCategoriesDelete(rctx)
 	if err != nil {
+		if result, handled := requeueUnauthorizedPrismError(rctx.Context, r.Recorder, rctx.NutanixCluster, rctx.NutanixCluster, true, err, r.SecretInformer, r.ConfigMapInformer); handled {
+			return result, nil
+		}
 		log.Error(err, "error occurred while running deletion of categories")
 		return reconcile.Result{}, err
 	}
+	nutanixclient.PrismAuthCircuit.RecordSuccess(rctx.NutanixCluster.GetNamespacedName())
 
 	// delete the client from the cache
 	log.Info(fmt.Sprintf("deleting nutanix prism client for cluster %s from cache", rctx.NutanixCluster.GetNamespacedName()))

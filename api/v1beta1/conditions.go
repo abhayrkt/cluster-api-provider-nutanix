@@ -105,6 +105,10 @@ const (
 
 	PrismCentralClientInitializationFailed            = "PrismClientInitFailed"
 	PrismCentralConvergedV4ClientInitializationFailed = "PrismClientConvergedV4InitFailed"
+
+	// PrismCentralAuthenticationFailed indicates Prism Central rejected the configured
+	// credentials (HTTP 401). Repeated failures back off so CAPX does not lock the account.
+	PrismCentralAuthenticationFailed = "PrismCentralAuthenticationFailed"
 )
 
 const (
