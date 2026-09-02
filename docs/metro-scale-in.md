@@ -296,6 +296,33 @@ flowchart TB
 
 Default surge timeline (example: 4 workers, 2+2, image change only). **This is the same 1-by-1 replacement as a normal CAPI MachineDeployment upgrade** (`maxSurge=1`, `maxUnavailable=0`): create one new VM, drain/delete one old VM, repeat. CAPX does not change that cadence. It only biases **which** old VM each delete step takes (fuller site of the **old** MachineSet).
 
+### Sequential: one replacement cycle, then the next (N = 4, sites A/B even)
+
+Start: **1** MachineSet, old image, **4** VMs (2A + 2B). You change the MachineDeployment template (image / Kubernetes version). Desired stays 4.
+
+**Cycle 1**
+
+1. CAPI creates a **new** MachineSet (new image) and sets its `spec.replicas` to **1**.
+2. CAPI creates one Machine + NutanixMachine. CAPX **placement** looks only at the new MachineSet (0+0) and puts that VM on the emptier site (tie → first FD). Now live VMs = **5** (4 old + 1 new). MachineSets = **2**.
+3. When that new machine is available, CAPI drops the **old** MachineSet from 4 → **3**.
+4. CAPX **balancer** sees old MS: live 4, spec 3, so `pendingDelete = 1`. It annotates `delete-machine` on one machine on the **fuller old site**. If old is still 2A+2B, that is a tie; it still picks one site (name order) and one newest machine there.
+5. CAPI MachineSet controller **deletes** that annotated Machine (or, if it raced, Newest/Random — one machine either way).
+6. CAPI Machine controller **drains** that node (cordon, evict pods, wait volumes), then CAPX **deletes the Prism VM**, then the Node and Machine objects go away.
+7. Old MS now 3 live, new MS 1 live. Total live = **4**. One replacement done.
+
+**Cycle 2**
+
+8. CAPI raises the new MachineSet 1 → **2**. CAPX places the second new VM using **only new-MS counts** (e.g. 1A+0B → site B). Live = **5**.
+9. CAPI drops old 3 → **2**. CAPX annotates one victim on the fuller **old** site. CAPI deletes, drains, CAPX deletes the VM. Live = **4**.
+
+**Cycles 3 and 4** — same: +1 new, −1 old, drain that one, until new spec = 4 and old spec = 0.
+
+**End**
+
+10. Old MachineSet has 0 live VMs (object may remain at `revisionHistoryLimit`). **1** MachineSet with VMs, **4** VMs on the new image. No extra VMs. New generation was placed 2+2 independently of which old site drained first.
+
+If CAPI deletes the old machine **before** the annotation lands, that single cycle can take the “wrong” site. The next cycle’s balancer uses the new old-MS counts and pulls back toward even. Still 1-by-1.
+
 ```mermaid
 sequenceDiagram
   autonumber
