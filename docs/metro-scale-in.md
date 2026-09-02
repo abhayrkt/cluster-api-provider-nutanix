@@ -9,6 +9,7 @@ It covers:
 - One vs many `MachineSet`s under the same `MachineDeployment`
 - Changing image and replica count at the same time
 - Where CAPX can race with CAPI
+- [How many MachineSets and VMs](#how-many-machinesets-and-vms) in each case
 - Operational concerns and what is *not* a concern
 
 **Read the [Concerns](#concerns) section before relying on this in production.** The important ones: CAPI can delete **one** machine on the wrong site per rolling step before CAPX annotates; the balancer does **not** watch Secrets or CAPI delete events; `maxUnavailable > 0` plus Newest/Random can dump a whole site; placement isolation is **per MachineSet name**, so a single-MS in-place replica change can still skew.
@@ -352,6 +353,116 @@ CAPI does **not** dump all old machines in one shot when `maxUnavailable=0`. Eac
 
 ---
 
+## How many MachineSets and VMs
+
+All counts below are for **one worker `MachineDeployment`**. They are not cluster-wide (control plane is a separate owner). “Live VMs” means Machines in that MD that are not already deleting.
+
+**MachineSet objects vs live generations**
+
+CAPI keeps **one MachineSet per template revision**. After a rollout finishes, `revisionHistoryLimit` (CAPI default **1**) can leave an extra MachineSet with `spec.replicas = 0` and **0 live VMs**. `kubectl get machinesets` may show 2 objects in “steady state”; only **one** of them has VMs. CAPX balances each object separately; an empty leftover is a no-op.
+
+Unless noted, strategy is CAPI default **`maxSurge=1`, `maxUnavailable=0`**. Then:
+
+- Max machines CAPI will *intend* at once: `MD.spec.replicas + 1`
+- Min it tries to keep available: `MD.spec.replicas`
+
+Worked numbers use **N = 4** workers (even split 2A+2B when balanced) unless the case is a replica change.
+
+| Case | MachineSets **with live VMs** | MachineSet **objects** (typical) | Live VMs |
+| --- | --- | --- | --- |
+| Steady, one template | **1** | 1, or 2 if an old revision is still kept at 0 replicas | **N** (example **4**) |
+| Pure scale-out, same image (4→6) | **1** (same MS, replicas raised) | 1 | **4 → 6** (creates on that MS) |
+| Pure scale-in, same image (6→4) | **1** | 1 | **6 → 4**. `spec.replicas` often jumps to 4 in one patch; live lags until CAPI deletes. `pendingDelete` can be **2** |
+| Image / k8s upgrade only (N stays 4) | **2** during, **1** after | 2 during; 1–2 after (history) | **4 or 5** each step (4 + one surge VM), then **4** |
+| Scale-in strategy (`maxSurge=0`, `maxUnavailable=1`), image only | **2** during, **1** after | 2 during; 1–2 after | **3 or 4** each step (delete first), then **4** |
+| Image **and** scale-up (4→6) | **2** during, **1** after | 2 during; 1–2 after | From **4** up toward **6 or 7** (`desired + surge`). New MS target is **6**, not 4 |
+| Image **and** scale-down (6→4) | **2** during, **1** after | 2 during; 1–2 after | From **6** down toward **4 or 5**. New MS target is **4**. Old still goes to 0 |
+| Leftover revision still has a VM | **3** (leftover + old + new) | 3+ | About **N or N+1**, **plus** leftover live machines until they delete |
+| Control-plane (KCP) | n/a for this operator | KCP’s own MachineSets | Not counted here |
+
+### Steady state
+
+```text
+MachineSets with VMs: 1
+Live VMs:             4     (MD.spec.replicas)
+```
+
+### Pure scale (no template change) — still one MachineSet
+
+CAPI does **not** create a second MachineSet. It patches the existing one.
+
+```text
+4 → 6:  1 MS,  live 4 then 5 then 6
+6 → 4:  1 MS,  spec 6→4 at once, live 6 then 5 then 4  (or 6→4 if both deletes land together)
+```
+
+### Image-only upgrade — two MachineSets until old is empty
+
+Default surge (`maxSurge=1`). New MS grows to **4**, old MS shrinks to **0**. Live total is **5** while the extra surge VM exists, **4** after each old delete.
+
+```text
+Step   MachineSets   Old spec   New spec   Live VMs (if Ready)
+0      1             4          —          4
+1      2             4          1          5
+2      2             3          1          4
+3      2             3          2          5
+4      2             2          2          4
+5      2             2          3          5
+6      2             1          3          4
+7      2             1          4          5
+8      2             0          4          4
+done   1 (or 2 objs) 0 or gone  4          4
+```
+
+Scale-in strategy (`maxSurge=0`, `maxUnavailable=1`): still **2** MachineSets during the rollout; live VMs are **3** after a delete and **4** after the replacement create.
+
+### Image and replica count together — still two MachineSets; new MS size is the **new** N
+
+Not “roll at 4 then scale.” The new MachineSet’s target is the new `MD.spec.replicas`.
+
+**4 → 6 + new image** (`maxTotal = 6+1 = 7`):
+
+```text
+During:  2 MachineSets (old → 0, new → 6)
+Live:    starts at 4; CAPI may raise the new MS by more than 1 in one
+         reconcile because there is room under 7. Peaks at 6 or 7.
+After:   1 MachineSet with 6 VMs
+```
+
+**6 → 4 + new image** (`maxTotal = 4+1 = 5`):
+
+```text
+During:  2 MachineSets (old → 0, new → 4)
+Live:    starts at 6 (above maxTotal), so old must shrink first;
+         then live sits around 4 or 5 until new = 4 and old = 0.
+After:   1 MachineSet with 4 VMs
+```
+
+Old `spec.replicas` can drop by **more than 1** in one MachineDeployment reconcile when the MD itself scaled down (see Concerns). That is still **2** MachineSets, not 1.
+
+### Three MachineSets
+
+Only when an **older** revision still has machines (or a second rollout starts before the previous old MS is gone):
+
+```text
+MS leftover  spec=0, live=1     (or 0 live, object only)
+MS old       spec shrinking, live catching up
+MS new       spec growing toward N
+Live VMs     ≈ N or N+1  + leftover live
+MachineSets  3 with a leftover VM; 2 if leftover is already empty
+```
+
+CAPX never sums these into one pool. Deletes on leftover or old cannot pick a new-MS VM.
+
+### What “in the end” is
+
+For every case above, when the MD is Available and revisions have drained:
+
+- **1** MachineSet with live VMs (plus at most `revisionHistoryLimit` empty old MachineSets)
+- **MD.spec.replicas** live worker VMs
+
+---
+
 ## Races with CAPI
 
 CAPX never deletes machines. The only structural race is **timing**: CAPI can act on `MachineSet.spec.replicas` (create or delete) **before** CAPX has patched `delete-machine` or finished placement. After each CAPI action, CAPX reconciles again.
@@ -515,7 +626,8 @@ Placement never sets `delete-machine`.
 
 | Question | Answer |
 | --- | --- |
-| How many MachineSets can one MD have? | One per revision; 2 during a normal rollout; 3+ if an older revision still has machines |
+| How many MachineSets can one MD have? | One per revision; **1** in steady/pure scale; **2** during a rollout; **3+** if an older revision still has machines. See [How many MachineSets and VMs](#how-many-machinesets-and-vms) |
+| How many live VMs in the end? | Always **MD.spec.replicas** on the current MachineSet. During default surge: **N or N+1**. Pure scale-in: live lags the new spec on the **same** MS |
 | Does the scale-in operator merge them? | No |
 | Can an old MS delete a new-MS machine? | No |
 | Do new VMs balance against old VMs still up? | No — placement key is MachineSet name |
