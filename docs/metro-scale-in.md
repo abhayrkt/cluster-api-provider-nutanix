@@ -9,6 +9,7 @@ It covers:
 - One vs many `MachineSet`s under the same `MachineDeployment`
 - Changing image and replica count at the same time
 - Where CAPX can race with CAPI
+- Operational concerns and what is *not* a concern
 
 Related code:
 
@@ -519,3 +520,37 @@ Placement never sets `delete-machine`.
 | Does changing image and replicas together disable the balancer? | No. Old set scales to 0 toward the new size; new set is born targeting that size |
 | Main race with CAPI? | MachineSet controller can delete (site-blind) before `delete-machine` is visible |
 | When is there one MS again? | After older revisions have 0 live machines and are removed |
+
+---
+
+## Concerns
+
+The design is a **bias**, not a lock. CAPI still creates and deletes machines. These are the real operational concerns.
+
+**1. CAPI can delete before CAPX annotates (main one)**  
+If the MachineSet controller runs first, that step is site-blind. Default `maxSurge=1` / `maxUnavailable=0` usually means **one** wrong-site delete, then the next step corrects. It is not a deadlock, but you can be 3–1 for a while.
+
+**2. Big replica drop in one shot**  
+High `maxUnavailable`, or image+replicas down together with a large step, marks extra victims with CAPI’s policy after sites are even. One batch can unbalance more than a 1-by-1 rollout.
+
+**3. Machines with no native-site label yet**  
+The balancer skips them. CAPI can still delete them. Early in create/placement, counts are wrong for that pass.
+
+**4. New MachineSet create stagger**  
+If the second new machine is not in the API yet, two VMs can land on the same site. Later machines fill the hole. Off-by-one on the new generation, not a collapse.
+
+**5. Operator / MHC / autoscaler**  
+Manual `delete-machine`, MachineHealthCheck, and remediation deletes ignore the balancer. Those can unbalance until the **next** scale-in.
+
+**6. Control plane is out of scope**  
+KCP scale-in on metro is **not** protected by this operator.
+
+**7. Informer cache**  
+The balancer lists from the informer cache (not APIReader). Stale lists can mark the wrong set for one reconcile; watches usually fix it. Placement already uses APIReader for that reason.
+
+**8. Pause split-brain (rare)**  
+If CAPI is not paused and CAPX is, deletes go site-blind with no annotations.
+
+**Not a concern:** mixing old and new MachineSets, or new VMs being placed using old VMs still up. That is explicitly isolated by MachineSet name.
+
+**If you want to harden later:** keep `maxUnavailable=0` on metro worker MachineDeployments, avoid huge replica drops in one patch, and treat MHC victims as known imbalance until the next scale-in.
