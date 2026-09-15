@@ -164,3 +164,24 @@ func Test_WaitForTaskCompletion(t *testing.T) {
 		})
 	}
 }
+
+func Test_GetTaskStatus_IncludesFailedSubtaskErrors(t *testing.T) {
+	client, err := nutanixtestclient.NewTestClient()
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		client.Close()
+	})
+
+	parentUUID := "parent-create-vm"
+	childUUID := "child-vnic"
+	client.AddMockHandler(nutanixtestclient.GetTaskURLPath(parentUUID), func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"status": "FAILED", "error_detail": "Failed to perform the operation on the VM with UUID 'EMPTY' as '' is not defined", "progress_message": "create VM", "operation_type": "createVM", "subtask_reference_list": [{"kind": "task", "uuid": "%s"}]}`, childUUID)
+	})
+	client.AddMockHandler(nutanixtestclient.GetTaskURLPath(childUUID), func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status": "FAILED", "error_detail": "Cannot allocate address! No DHCP pool is defined or the DHCP pool is exhausted", "progress_message": "Create VM vNIC port", "operation_type": "Create VM vNIC port"}`)
+	})
+
+	status, err := GetTaskStatus(context.Background(), client.Client, parentUUID)
+	assert.Equal(t, "FAILED", status)
+	assert.EqualError(t, err, "error_detail: Failed to perform the operation on the VM with UUID 'EMPTY' as '' is not defined, progress_message: create VM; failed_subtasks: [Create VM vNIC port] error_detail: Cannot allocate address! No DHCP pool is defined or the DHCP pool is exhausted, progress_message: Create VM vNIC port")
+}

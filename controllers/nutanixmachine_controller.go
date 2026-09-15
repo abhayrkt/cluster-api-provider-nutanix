@@ -1822,7 +1822,7 @@ func (r *NutanixMachineReconciler) getOrCreateVM(rctx *nctx.MachineContext) (*vm
 
 	// Create the actual VM/Machine
 	log.Info(fmt.Sprintf("Creating VM with name %s for cluster %s", vmName, rctx.NutanixCluster.Name))
-	vm, err = convergedClient.VMs.Create(ctx, vm)
+	createOp, err := convergedClient.VMs.CreateAsync(ctx, vm)
 	if err != nil {
 		errorMsg := fmt.Errorf("failed to create VM %s: %w", vmName, err)
 		if !isRetryableAPIError(err) {
@@ -1830,6 +1830,20 @@ func (r *NutanixMachineReconciler) getOrCreateVM(rctx *nctx.MachineContext) (*vm
 		}
 		return nil, errorMsg
 	}
+	createdVMs, err := waitForConvergedOperation(ctx, convergedClient, createOp)
+	if err != nil {
+		errorMsg := fmt.Errorf("failed to create VM %s: %w", vmName, err)
+		if !isRetryableAPIError(err) {
+			rctx.SetFailureStatus(createErrorFailureReason, errorMsg)
+		}
+		return nil, errorMsg
+	}
+	if len(createdVMs) == 0 || createdVMs[0] == nil {
+		errorMsg := fmt.Errorf("failed to create VM %s: operation completed but no VM returned", vmName)
+		rctx.SetFailureStatus(createErrorFailureReason, errorMsg)
+		return nil, errorMsg
+	}
+	vm = createdVMs[0]
 
 	vmUuid := *vm.ExtId
 	powerState := "UNKNOWN"
@@ -1905,7 +1919,7 @@ func (r *NutanixMachineReconciler) powerOnVM(rctx *nctx.MachineContext, vmUUID, 
 		}
 		return nil, errMsg
 	}
-	_, err = powerOnTask.Wait(ctx)
+	_, err = waitForConvergedOperation(ctx, convergedClient, powerOnTask)
 	if err != nil {
 		errMsg := fmt.Errorf("error occured while waiting for VM %s to power on: %w", vmName, err)
 		if !isRetryableAPIError(err) {
