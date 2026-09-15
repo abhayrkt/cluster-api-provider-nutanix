@@ -18,9 +18,7 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	nutanixClientV3 "github.com/nutanix-cloud-native/prism-go-client/v3"
@@ -54,62 +52,10 @@ func GetTaskStatus(ctx context.Context, client *nutanixClientV3.Client, uuid str
 	}
 
 	if *v.Status == "INVALID_UUID" || *v.Status == "FAILED" {
-		errMsg := fmt.Sprintf("error_detail: %s, progress_message: %s", ptr.Deref(v.ErrorDetail, ""), ptr.Deref(v.ProgressMessage, ""))
-		subtaskErrs := collectFailedV3SubtaskErrors(ctx, client, v, map[string]struct{}{uuid: {}})
-		if len(subtaskErrs) > 0 {
-			log.Error(errors.New(errMsg), "Prism parent task failed; including failed subtask errors",
-				"taskUUID", uuid,
-				"subtaskErrors", subtaskErrs,
-			)
-			errMsg = fmt.Sprintf("%s; failed_subtasks: %s", errMsg, strings.Join(subtaskErrs, "; "))
-		}
-		return *v.Status, errors.New(errMsg)
+		return *v.Status,
+			fmt.Errorf("error_detail: %s, progress_message: %s", ptr.Deref(v.ErrorDetail, ""), ptr.Deref(v.ProgressMessage, ""))
 	}
 	taskStatus := *v.Status
 	log.V(1).Info(fmt.Sprintf("Status for task with UUID %s: %s", uuid, taskStatus))
 	return taskStatus, nil
-}
-
-func collectFailedV3SubtaskErrors(ctx context.Context, client *nutanixClientV3.Client, parent *nutanixClientV3.TasksResponse, visited map[string]struct{}) []string {
-	if parent == nil || len(parent.SubtaskReferenceList) == 0 {
-		return nil
-	}
-
-	log := ctrl.LoggerFrom(ctx)
-	var msgs []string
-	for _, ref := range parent.SubtaskReferenceList {
-		if ref == nil || ref.UUID == nil || *ref.UUID == "" {
-			continue
-		}
-		childUUID := *ref.UUID
-		if _, seen := visited[childUUID]; seen {
-			continue
-		}
-		visited[childUUID] = struct{}{}
-
-		child, err := client.V3.GetTask(ctx, childUUID)
-		if err != nil {
-			log.Error(err, "failed to get Prism subtask while collecting failure details", "subtaskUUID", childUUID)
-			continue
-		}
-		if child.Status == nil || (*child.Status != "FAILED" && *child.Status != "INVALID_UUID") {
-			continue
-		}
-
-		op := ptr.Deref(child.OperationType, "")
-		if op == "" {
-			op = "unknown"
-		}
-		detail := fmt.Sprintf("[%s] error_detail: %s, progress_message: %s",
-			op, ptr.Deref(child.ErrorDetail, ""), ptr.Deref(child.ProgressMessage, ""))
-		log.Info("failed Prism subtask",
-			"subtaskUUID", childUUID,
-			"operation", op,
-			"errorDetail", ptr.Deref(child.ErrorDetail, ""),
-			"progressMessage", ptr.Deref(child.ProgressMessage, ""),
-		)
-		msgs = append(msgs, detail)
-		msgs = append(msgs, collectFailedV3SubtaskErrors(ctx, client, child, visited)...)
-	}
-	return msgs
 }

@@ -51,7 +51,7 @@ func enrichTaskErrorWithFailedSubtasks(ctx context.Context, client *v4Converged.
 		return parentErr
 	}
 
-	subtaskErrs := collectFailedV4SubtaskErrors(ctx, client, parentTaskUUID, map[string]struct{}{})
+	subtaskErrs := collectFailedSubtaskErrors(ctx, client, parentTaskUUID, map[string]struct{}{})
 	if len(subtaskErrs) == 0 {
 		return parentErr
 	}
@@ -64,7 +64,7 @@ func enrichTaskErrorWithFailedSubtasks(ctx context.Context, client *v4Converged.
 	return fmt.Errorf("%w; failed_subtasks: %s", parentErr, strings.Join(subtaskErrs, "; "))
 }
 
-func collectFailedV4SubtaskErrors(ctx context.Context, client *v4Converged.Client, parentTaskUUID string, visited map[string]struct{}) []string {
+func collectFailedSubtaskErrors(ctx context.Context, client *v4Converged.Client, parentTaskUUID string, visited map[string]struct{}) []string {
 	if parentTaskUUID == "" {
 		return nil
 	}
@@ -91,17 +91,17 @@ func collectFailedV4SubtaskErrors(ctx context.Context, client *v4Converged.Clien
 		if child.Status == nil || *child.Status != prismModels.TASKSTATUS_FAILED {
 			continue
 		}
-		detail := formatV4TaskError(&child)
+		detail := formatTaskError(&child)
 		childUUID := ptr.Deref(child.ExtId, "")
 		log.Info("failed Prism subtask",
 			"parentTaskUUID", parentTaskUUID,
 			"subtaskUUID", childUUID,
-			"operation", v4TaskOperation(&child),
+			"operation", taskOperation(&child),
 			"error", detail,
 		)
 		msgs = append(msgs, detail)
 		if childUUID != "" {
-			msgs = append(msgs, collectFailedV4SubtaskErrors(ctx, client, childUUID, visited)...)
+			msgs = append(msgs, collectFailedSubtaskErrors(ctx, client, childUUID, visited)...)
 		}
 	}
 	return msgs
@@ -139,7 +139,7 @@ func failedSubtasksFromParentGet(ctx context.Context, client *v4Converged.Client
 	return children
 }
 
-func v4TaskOperation(task *prismModels.Task) string {
+func taskOperation(task *prismModels.Task) string {
 	if task == nil {
 		return "unknown"
 	}
@@ -152,8 +152,8 @@ func v4TaskOperation(task *prismModels.Task) string {
 	return "unknown"
 }
 
-func formatV4TaskError(task *prismModels.Task) string {
-	op := v4TaskOperation(task)
+func formatTaskError(task *prismModels.Task) string {
+	op := taskOperation(task)
 
 	var parts []string
 	if task != nil {
