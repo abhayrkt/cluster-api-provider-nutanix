@@ -3324,16 +3324,15 @@ func TestNutanixMachineReconciler_getOrCreateVM(t *testing.T) {
 			ExtId: &imageUUID,
 		}, nil)
 
-		// Mock Tasks.List calls in order:
-		// 1. ImageMarkedForDeletion check returns empty
-		// 2. GetTaskUUIDFromVM after VM creation returns task with UUID
+		// Mock Tasks.List for ImageMarkedForDeletion.
 		mockConvergedClient.MockTasks.EXPECT().List(ctx, gomock.Any()).Return([]prismModels.Task{}, nil)
 
-		// Mock CreateVM
 		createdVM := vmmModels.NewVm()
 		createdVM.Name = ptr.To(vmName)
 		createdVM.ExtId = ptr.To(vmUUID)
-		mockConvergedClient.MockVMs.EXPECT().Create(ctx, gomock.Any()).Return(createdVM, nil)
+		createOp := mockconverged.NewMockOperation[vmmModels.Vm](ctrl)
+		mockConvergedClient.MockVMs.EXPECT().CreateAsync(ctx, gomock.Any()).Return(createOp, nil)
+		createOp.EXPECT().Wait(ctx).Return([]*vmmModels.Vm{createdVM}, nil)
 
 		// Create machine context
 		rctx := &nctx.MachineContext{

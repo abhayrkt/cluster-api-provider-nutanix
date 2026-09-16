@@ -941,6 +941,7 @@ func (r *NutanixVirtualHADomainReconciler) getOrCreateVHADomainRecoveryPlan(
 	}
 	log.Info("Waiting for recovery plan creation task", "name", rpName, "taskUUID", taskUUID)
 	if err := nutanixclient.WaitForTaskToSucceed(rctx.Context, rctx.NutanixClient, taskUUID); err != nil {
+		err = enrichTaskErrorWithFailedSubtasks(rctx.Context, rctx.ConvergedClient, taskUUID, err)
 		return nil, fmt.Errorf("recovery plan %s creation task failed: %w", rpName, err)
 	}
 
@@ -1003,6 +1004,7 @@ func (r *NutanixVirtualHADomainReconciler) deleteVHADomainRecoveryPlans(rctx *nc
 				if ok && taskUUID != "" {
 					log.V(1).Info("Waiting for recovery plan deletion task", "identifier", rp.DisplayString(), "taskUUID", taskUUID)
 					if err := nutanixclient.WaitForTaskToSucceed(rctx.Context, rctx.NutanixClient, taskUUID); err != nil {
+						err = enrichTaskErrorWithFailedSubtasks(rctx.Context, rctx.ConvergedClient, taskUUID, err)
 						return fmt.Errorf("recovery plan %s deletion task failed: %w", rp.DisplayString(), err)
 					}
 				}
